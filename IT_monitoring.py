@@ -13,6 +13,7 @@ Playwright は使わず requests + BeautifulSoup で取得します。トップ�
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -38,6 +39,7 @@ CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 90
 REQUEST_RETRIES = 3
 REQUEST_BACKOFF = 1.5
+DEBUG = os.getenv("IT_MONITORING_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
 # ───────── Keywords ──────────────────────────────────────
 KEYWORDS = [
@@ -63,6 +65,15 @@ KEYWORDS = [
 ]
 SHORT_ASCII = {"ai", "it", "dx", "5g"}
 DATE_RE = re.compile(r"(\d{4})年\s*0?(\d{1,2})月\s*0?(\d{1,2})日")
+
+
+def debug(message: str) -> None:
+    if DEBUG:
+        print(f"[DBG] {message}", file=sys.stderr)
+
+
+def warn(message: str) -> None:
+    print(f"[WARN] {message}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -149,11 +160,11 @@ def make_session() -> Session:
 
 
 def fetch_html(session: Session, url: str) -> str:
-    print(f"[DBG] GET {url} timeout=({CONNECT_TIMEOUT}, {READ_TIMEOUT})", file=sys.stderr)
+    debug(f"GET {url} timeout=({CONNECT_TIMEOUT}, {READ_TIMEOUT})")
     start = time.monotonic()
     response: Response = session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     elapsed = time.monotonic() - start
-    print(f"[DBG] HTTP {response.status_code} {url} {len(response.content)} bytes in {elapsed:.1f}s", file=sys.stderr)
+    debug(f"HTTP {response.status_code} {url} {len(response.content)} bytes in {elapsed:.1f}s")
     response.raise_for_status()
     if not response.encoding or response.encoding.lower() == "iso-8859-1":
         response.encoding = response.apparent_encoding or "utf-8"
@@ -210,17 +221,17 @@ def scrape_press_releases() -> list[PressRelease]:
                 html = fetch_html(session, url)
                 releases = list(iter_press_releases(html, url))
                 if releases:
-                    print(f"[DBG] matched {len(releases)} item(s) from {url}", file=sys.stderr)
+                    debug(f"matched {len(releases)} item(s) from {url}")
                     return dedupe_and_sort(releases)
-                print(f"[DBG] no matching item from {url}; trying next candidate", file=sys.stderr)
+                debug(f"no matching item from {url}; trying next candidate")
             except requests.RequestException as exc:
                 errors.append(f"{url}: {exc}")
-                print(f"[DBG] request failed: {url}: {exc}", file=sys.stderr)
+                debug(f"request failed: {url}: {exc}")
 
     if errors:
-        print("[DBG] all candidate URLs failed or had no matches", file=sys.stderr)
+        warn("経済産業省ニュースリリースを取得できませんでした。詳細は IT_MONITORING_DEBUG=1 で確認してください。")
         for error in errors:
-            print(f"[DBG] {error}", file=sys.stderr)
+            debug(error)
     return []
 
 
@@ -237,7 +248,7 @@ def dedupe_and_sort(releases: Iterable[PressRelease]) -> list[PressRelease]:
 
 
 def main() -> None:
-    print("経済産業省プレスリリース『投資・IT』関連情報取得開始...", file=sys.stderr)
+    debug("経済産業省プレスリリース『投資・IT』関連情報取得開始")
     releases = scrape_press_releases()
     print("【経済産業省ニュースリリース（投資・IT関連）】")
     if not releases:

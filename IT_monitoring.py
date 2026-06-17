@@ -35,10 +35,10 @@ LOOKBACK = 14
 JST = timezone(timedelta(hours=9))
 TODAY = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
 WIN_FROM = TODAY - timedelta(days=LOOKBACK)
-CONNECT_TIMEOUT = 10
-READ_TIMEOUT = 90
-REQUEST_RETRIES = 3
-REQUEST_BACKOFF = 1.5
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 20
+REQUEST_RETRIES = 1
+REQUEST_BACKOFF = 0.5
 DEBUG = os.getenv("IT_MONITORING_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
 # ───────── Keywords ──────────────────────────────────────
@@ -128,9 +128,9 @@ def month_urls(today: datetime, lookback_days: int) -> list[str]:
 
 
 def candidate_urls() -> list[str]:
-    # Try the normal page first, then monthly archives. The monthly pages are useful
-    # when /press/ is slow from GitHub Actions or a local corporate network.
-    return [BASE_URL, *month_urls(TODAY, LOOKBACK)]
+    # Monthly archives are narrower and tend to respond faster than /press/.
+    # Keep /press/ as the last fallback so a slow top page does not delay normal runs.
+    return [*month_urls(TODAY, LOOKBACK), BASE_URL]
 
 
 def make_session() -> Session:

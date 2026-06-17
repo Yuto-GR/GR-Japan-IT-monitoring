@@ -6,13 +6,13 @@ METI press release watcher.
 経済産業省「ニュースリリース」から、指定キーワードにマッチする直近の
 プレスリリースを抽出して表示します。
 
-`https://www.meti.go.jp/press/` は静的 HTML でも最新リリースを返すため、
-Playwright は使わず requests + BeautifulSoup で取得します。トップページが
-遅い・応答しない場合は当月/前月の月別アーカイブへフォールバックします。
+外部パッケージに依存せず、この Codex 環境でも `--self-test` で解析ロジックを
+検証できるよう、HTTP 取得と HTML 解析は Python 標準ライブラリで実装しています。
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
@@ -20,14 +20,12 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import unescape
+from html.parser import HTMLParser
 from typing import Iterable
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
-
-import requests
-from bs4 import BeautifulSoup
-from requests import Response, Session
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib.request import Request, urlopen
 
 # ───────── Settings ──────────────────────────────────────
 BASE_URL = "https://www.meti.go.jp/press/"
@@ -35,7 +33,6 @@ LOOKBACK = 14
 JST = timezone(timedelta(hours=9))
 TODAY = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
 WIN_FROM = TODAY - timedelta(days=LOOKBACK)
-CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 20
 REQUEST_RETRIES = 1
 REQUEST_BACKOFF = 0.5
@@ -67,15 +64,6 @@ SHORT_ASCII = {"ai", "it", "dx", "5g"}
 DATE_RE = re.compile(r"(\d{4})年\s*0?(\d{1,2})月\s*0?(\d{1,2})日")
 
 
-def debug(message: str) -> None:
-    if DEBUG:
-        print(f"[DBG] {message}", file=sys.stderr)
-
-
-def warn(message: str) -> None:
-    print(f"[WARN] {message}", file=sys.stderr)
-
-
 @dataclass(frozen=True)
 class PressRelease:
     dt: datetime
@@ -85,6 +73,22 @@ class PressRelease:
     @property
     def date_label(self) -> str:
         return f"{self.dt.month}月{self.dt.day}日"
+
+
+@dataclass(frozen=True)
+class AnchorCandidate:
+    href: str
+    title: str
+    context_before: str
+
+
+def debug(message: str) -> None:
+    if DEBUG:
+        print(f"[DBG] {message}", file=sys.stderr)
+
+
+def warn(message: str) -> None:
+    print(f"[WARN] {message}", file=sys.stderr)
 
 
 def normalize(text: str) -> str:
@@ -133,9 +137,8 @@ def candidate_urls() -> list[str]:
     return [*month_urls(TODAY, LOOKBACK), BASE_URL]
 
 
-def make_session() -> Session:
-    session = requests.Session()
-    session.headers.update({
+def request_headers() -> dict[str, str]:
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -143,90 +146,111 @@ def make_session() -> Session:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
         "Connection": "close",
-    })
-    retry = Retry(
-        total=REQUEST_RETRIES,
-        connect=REQUEST_RETRIES,
-        read=REQUEST_RETRIES,
-        status=REQUEST_RETRIES,
-        backoff_factor=REQUEST_BACKOFF,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "HEAD"),
-        raise_on_status=False,
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.mount("http://", HTTPAdapter(max_retries=retry))
-    return session
+    }
 
 
-def fetch_html(session: Session, url: str) -> str:
-    debug(f"GET {url} timeout=({CONNECT_TIMEOUT}, {READ_TIMEOUT})")
-    start = time.monotonic()
-    response: Response = session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-    elapsed = time.monotonic() - start
-    debug(f"HTTP {response.status_code} {url} {len(response.content)} bytes in {elapsed:.1f}s")
-    response.raise_for_status()
-    if not response.encoding or response.encoding.lower() == "iso-8859-1":
-        response.encoding = response.apparent_encoding or "utf-8"
-    return response.text
+def fetch_html(url: str) -> str:
+    """Fetch HTML with short retries using only the standard library."""
+    last_error: Exception | None = None
+    for attempt in range(REQUEST_RETRIES + 1):
+        debug(f"GET {url} attempt={attempt + 1} timeout={READ_TIMEOUT}")
+        start = time.monotonic()
+        try:
+            request = Request(url, headers=request_headers())
+            with urlopen(request, timeout=READ_TIMEOUT) as response:
+                body = response.read()
+                charset = response.headers.get_content_charset() or "utf-8"
+                elapsed = time.monotonic() - start
+                debug(f"HTTP {response.status} {url} {len(body)} bytes in {elapsed:.1f}s")
+                return body.decode(charset, errors="replace")
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            debug(f"request failed: {url}: {exc}")
+            if attempt < REQUEST_RETRIES:
+                time.sleep(REQUEST_BACKOFF * (attempt + 1))
+
+    raise RuntimeError(f"failed to fetch {url}: {last_error}")
+
+
+class PressListParser(HTMLParser):
+    """Collect anchor text and nearby preceding text from METI list HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.anchors: list[AnchorCandidate] = []
+        self._recent_text: list[str] = []
+        self._current_href: str | None = None
+        self._current_title: list[str] = []
+        self._current_context_before = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if href:
+            self._current_href = href
+            self._current_title = []
+            self._current_context_before = " ".join(self._recent_text[-40:])
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(unescape(data).split())
+        if not text:
+            return
+        self._recent_text.append(text)
+        if len(self._recent_text) > 80:
+            self._recent_text = self._recent_text[-80:]
+        if self._current_href:
+            self._current_title.append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._current_href:
+            return
+        title = " ".join(self._current_title).strip()
+        if title:
+            self.anchors.append(AnchorCandidate(
+                href=self._current_href,
+                title=title,
+                context_before=self._current_context_before,
+            ))
+        self._current_href = None
+        self._current_title = []
+        self._current_context_before = ""
 
 
 def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
-    soup = BeautifulSoup(html, "html.parser")
+    parser = PressListParser()
+    parser.feed(html)
     seen_links: set[str] = set()
 
-    for anchor in soup.find_all("a", href=True):
-        title = anchor.get_text(" ", strip=True)
+    for anchor in parser.anchors:
+        title = anchor.title
         if not title or not kw_hit(title):
             continue
 
-        date = find_nearby_date(anchor)
+        date = parse_date(anchor.context_before)
         if not date or date < WIN_FROM or date > TODAY:
             continue
 
-        url = urljoin(base_url, anchor["href"])
+        url = urljoin(base_url, anchor.href)
         if url in seen_links:
             continue
         seen_links.add(url)
         yield PressRelease(dt=date, title=title, url=url)
 
 
-def find_nearby_date(anchor) -> datetime | None:
-    # METI press lists usually have the date in the same list item/parent block,
-    # before the title. Search a compact surrounding text block first.
-    for parent in [anchor.parent, anchor.find_parent("li"), anchor.find_parent("dl"), anchor.find_parent("div")]:
-        if parent:
-            parsed = parse_date(parent.get_text(" ", strip=True))
-            if parsed:
-                return parsed
-
-    # Fallback for simple text order: look at a few previous siblings.
-    sibling = anchor.previous_sibling
-    checked = 0
-    while sibling is not None and checked < 6:
-        text = sibling.get_text(" ", strip=True) if hasattr(sibling, "get_text") else str(sibling)
-        parsed = parse_date(text)
-        if parsed:
-            return parsed
-        sibling = sibling.previous_sibling
-        checked += 1
-    return None
-
-
 def scrape_press_releases() -> list[PressRelease]:
     errors: list[str] = []
-    with make_session() as session:
-        for url in candidate_urls():
-            try:
-                html = fetch_html(session, url)
-                releases = list(iter_press_releases(html, url))
-                if releases:
-                    debug(f"matched {len(releases)} item(s) from {url}")
-                    return dedupe_and_sort(releases)
-                debug(f"no matching item from {url}; trying next candidate")
-            except requests.RequestException as exc:
-                errors.append(f"{url}: {exc}")
-                debug(f"request failed: {url}: {exc}")
+    for url in candidate_urls():
+        try:
+            html = fetch_html(url)
+            releases = list(iter_press_releases(html, url))
+            if releases:
+                debug(f"matched {len(releases)} item(s) from {url}")
+                return dedupe_and_sort(releases)
+            debug(f"no matching item from {url}; trying next candidate")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            debug(str(exc))
 
     if errors:
         warn("経済産業省ニュースリリースを取得できませんでした。詳細は IT_MONITORING_DEBUG=1 で確認してください。")
@@ -247,16 +271,52 @@ def dedupe_and_sort(releases: Iterable[PressRelease]) -> list[PressRelease]:
     return output
 
 
-def main() -> None:
-    debug("経済産業省プレスリリース『投資・IT』関連情報取得開始")
-    releases = scrape_press_releases()
+def print_releases(releases: Iterable[PressRelease]) -> None:
     print("【経済産業省ニュースリリース（投資・IT関連）】")
+    releases = list(releases)
     if not releases:
         print("該当データなし")
         return
     for release in releases:
         print(f"○{release.date_label}　{release.title}")
         print(f"　{release.url}\n")
+
+
+def run_self_test() -> None:
+    sample_html = """
+    <html><body><ul>
+      <li><span>2026年6月12日</span>
+        <a href="/press/2026/06/20260612001/20260612001.html">成長投資ガイダンス（案）を公表しました</a>
+      </li>
+      <li><span>2026年6月11日</span>
+        <a href="/press/2026/06/ignored.html">関係ない発表</a>
+      </li>
+      <li><span>2026年6月10日</span>
+        <a href="/press/2026/06/ai.html">AI政策に関するガイドラインを改定しました</a>
+      </li>
+    </ul></body></html>
+    """
+    releases = dedupe_and_sort(iter_press_releases(sample_html, BASE_URL))
+    assert len(releases) == 2, releases
+    assert releases[0].title == "成長投資ガイダンス（案）を公表しました"
+    assert releases[0].url == "https://www.meti.go.jp/press/2026/06/20260612001/20260612001.html"
+    assert kw_hit("政調でデジタル政策を議論")
+    assert kw_hit("ローカル5Gの無線局免許状を交付")
+    assert not kw_hit("baitという英単語だけでは一致しない")
+    print("self-test ok")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="METI press release watcher")
+    parser.add_argument("--self-test", action="store_true", help="run offline parser tests and exit")
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        run_self_test()
+        return
+
+    debug("経済産業省プレスリリース『投資・IT』関連情報取得開始")
+    print_releases(scrape_press_releases())
 
 
 if __name__ == "__main__":

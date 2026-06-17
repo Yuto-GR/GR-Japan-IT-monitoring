@@ -125,7 +125,7 @@ def month_urls(today: datetime, lookback_days: int) -> list[str]:
     current = today.replace(day=1)
     lower_bound = today - timedelta(days=lookback_days)
     while current >= lower_bound.replace(day=1):
-        urls.append(urljoin(BASE_URL, f"{current.year}/{current.month:02d}/"))
+        urls.append(urljoin(BASE_URL, f"archive_{current.year}{current.month:02d}.html"))
         previous_month_last_day = current - timedelta(days=1)
         current = previous_month_last_day.replace(day=1)
     return urls
@@ -300,6 +300,7 @@ def run_self_test() -> None:
     assert len(releases) == 2, releases
     assert releases[0].title == "成長投資ガイダンス（案）を公表しました"
     assert releases[0].url == "https://www.meti.go.jp/press/2026/06/20260612001/20260612001.html"
+    assert month_urls(datetime(2026, 6, 17, tzinfo=JST), LOOKBACK)[0] == "https://www.meti.go.jp/press/archive_202606.html"
     assert kw_hit("政調でデジタル政策を議論")
     assert kw_hit("ローカル5Gの無線局免許状を交付")
     assert not kw_hit("baitという英単語だけでは一致しない")

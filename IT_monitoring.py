@@ -1,171 +1,263 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-meti_shingikai_scraper.py  rev-2.2-DBG  (2025-06-18)
+METI press release watcher.
 
-■ 目的
-  経済産業省「審議会・研究会（新着情報）」ページ（動的描画）から
-  指定キーワードにマッチする過去4日分の会議案内を抽出して表示します。
-  ネットワーク・レンダリング周りのトラブルシュート用にデバッグログを大量に出力します。
+経済産業省「ニュースリリース」から、指定キーワードにマッチする直近の
+プレスリリースを抽出して表示します。
 
-■ 依存パッケージ
-  pip install playwright beautifulsoup4
-  playwright install chromium
+`https://www.meti.go.jp/press/` は静的 HTML でも最新リリースを返すため、
+Playwright は使わず requests + BeautifulSoup で取得します。トップページが
+遅い・応答しない場合は当月/前月の月別アーカイブへフォールバックします。
 """
 
+from __future__ import annotations
+
+import os
 import re
 import sys
-import socket
+import time
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Iterable
 from urllib.parse import urljoin
 
+import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from requests import Response, Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ───────── Settings ──────────────────────────────────────
-BASE_URL = "https://www.meti.go.jp/shingikai/"
-LOOKBACK = 4
+BASE_URL = "https://www.meti.go.jp/press/"
+LOOKBACK = 14
 JST = timezone(timedelta(hours=9))
 TODAY = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
 WIN_FROM = TODAY - timedelta(days=LOOKBACK)
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 20
+REQUEST_RETRIES = 1
+REQUEST_BACKOFF = 0.5
+DEBUG = os.getenv("IT_MONITORING_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
 # ───────── Keywords ──────────────────────────────────────
 KEYWORDS = [
-    "DX", "デジタル", "クラウド", "ガバメントクラウド", "データセンター",
+    "投資", "成長投資", "設備投資", "対内直接投資", "海外投資", "投資促進",
+    # ── 政治・政策 ──
+    "デジタル社会推進本部", "経済安全保障対策本部", "経済安全保障推進本部",
+    "情報通信戦略調査会", "経済成長戦略本部", "知的財産戦略調査会",
+    "競争政策調査会", "プラットフォームサービス", "特定利用者情報",
+    "web3", "web3.0研究会", "デジタル社会構想会議", "デジタル臨時行政調査会",
+    "デジタル社会推進会議",
+    # 注意：「政調」は kw_hit() 関数内で優先的に処理される
+    # ── 技術一般 ──
+    "デジタル", "情報通信", "サイバー", "AI", "ＤＸ", "DX", "IT", "5g",
+    # ── 行政関連 ──
+    "標準仕様", "ガイドライン", "無線局", "免許状", "光ファイバ",
+    "クラウド", "ガバメントクラウド", "データセンター",
     "経済安全保障", "QUAD", "サプライチェーン", "セキュリティクリアランス",
-    "電気通信事業法", "サイバーセキュリティ", "Web3", "半導体", "AI",
+    "電気通信事業法", "サイバーセキュリティ", "Web3", "半導体",
     "GIGAスクール構想", "量子コンピューター", "スーパーコンピュータ",
     "スマホ新法", "青少年インターネット環境整備法", "Fintech",
     "中央銀行デジタル通貨", "知的財産", "個人情報保護", "医療DX",
-    "新年度予算（デジタル関連）", "環境"
+    "新年度予算（デジタル関連）", "環境",
 ]
-SHORT_ASCII = {"ai", "it", "dx"}
+SHORT_ASCII = {"ai", "it", "dx", "5g"}
+DATE_RE = re.compile(r"(\d{4})年\s*0?(\d{1,2})月\s*0?(\d{1,2})日")
+
+
+def debug(message: str) -> None:
+    if DEBUG:
+        print(f"[DBG] {message}", file=sys.stderr)
+
+
+def warn(message: str) -> None:
+    print(f"[WARN] {message}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class PressRelease:
+    dt: datetime
+    title: str
+    url: str
+
+    @property
+    def date_label(self) -> str:
+        return f"{self.dt.month}月{self.dt.day}日"
+
 
 def normalize(text: str) -> str:
     return unicodedata.normalize("NFKC", text).lower()
 
+
 def kw_hit(text: str) -> bool:
-    t = normalize(text)
+    normalized = normalize(text)
+    # 「政調」は他の短い英数字キーワードより先に判定する。
+    if "政調" in normalized:
+        return True
+
     for kw in KEYWORDS:
-        k = normalize(kw)
-        if k in SHORT_ASCII:
-            if re.search(rf"(?:^|[^a-z0-9]){k}(?:[^a-z0-9]|$)", t):
+        keyword = normalize(kw)
+        if keyword in SHORT_ASCII:
+            if re.search(rf"(?:^|[^a-z0-9]){re.escape(keyword)}(?:[^a-z0-9]|$)", normalized):
                 return True
-        elif k in t:
+        elif keyword in normalized:
             return True
     return False
 
-# ───────── Date parsing ──────────────────────────────────
-DATE_RE = re.compile(r"(\d{4})年\s*0?(\d{1,2})月\s*0?(\d{1,2})日")
 
-def parse_date(s: str):
-    m = DATE_RE.search(s)
-    if not m:
+def parse_date(text: str) -> datetime | None:
+    match = DATE_RE.search(text)
+    if not match:
         return None
-    y, mth, d = map(int, m.groups())
-    return datetime(y, mth, d, tzinfo=JST)
+    year, month, day = map(int, match.groups())
+    return datetime(year, month, day, tzinfo=JST)
 
-# ───────── Fetch dynamic HTML via Playwright ─────────────
-def fetch_html_dynamic(url: str) -> str:
-    # ── ネットワーク接続確認
-    try:
-        socket.create_connection(("www.google.com", 80), timeout=5)
-        print("[DBG] network check: OK", file=sys.stderr)
-    except Exception as e:
-        print(f"[DBG] network check failed: {e}", file=sys.stderr)
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
-        ))
-        # ブロックして高速化
-        ctx.route("**/*.{png,jpg,jpeg,gif,svg,webp,css,js,woff,woff2}",
-                  lambda route: route.abort())
-        page = ctx.new_page()
-        # ── Playwright.goto デバッグ
-        try:
-            print(f"[DBG] playwright.goto start for {url}", file=sys.stderr)
-            page.goto(url, wait_until="commit", timeout=60000)
-            print("[DBG] playwright.goto succeeded", file=sys.stderr)
-        except Exception as e:
-            print(f"[DBG] playwright.goto failed: {e}", file=sys.stderr)
-            browser.close()
-            raise
-        # ── 一覧要素の待機
-        try:
-            print("[DBG] waiting for selector ul.shingikaiList li", file=sys.stderr)
-            page.wait_for_selector("ul.shingikaiList li", timeout=60000)
-            print("[DBG] selector appeared", file=sys.stderr)
-        except Exception as e:
-            print(f"[DBG] wait_for_selector failed: {e}", file=sys.stderr)
-        html = page.content()
-        browser.close()
-        return html
+def month_urls(today: datetime, lookback_days: int) -> list[str]:
+    """Return month archive URLs that can overlap the target window."""
+    urls: list[str] = []
+    current = today.replace(day=1)
+    lower_bound = today - timedelta(days=lookback_days)
+    while current >= lower_bound.replace(day=1):
+        urls.append(urljoin(BASE_URL, f"{current.year}/{current.month:02d}/"))
+        previous_month_last_day = current - timedelta(days=1)
+        current = previous_month_last_day.replace(day=1)
+    return urls
 
-# ───────── Main scraper ──────────────────────────────────
-def scrape_shingikai():
-    html = fetch_html_dynamic(BASE_URL)
-    # ── HTMLプレースホルダー検出
-    if "Javascriptを有効にしてください" in html:
-        print("[DBG] placeholder HTML detected", file=sys.stderr)
-    # ── HTML情報
-    print(f"[DBG] fetched HTML length: {len(html)}", file=sys.stderr)
-    print(f"[DBG] head snippet: {html[:200]!r}", file=sys.stderr)
 
+def candidate_urls() -> list[str]:
+    # Monthly archives are narrower and tend to respond faster than /press/.
+    # Keep /press/ as the last fallback so a slow top page does not delay normal runs.
+    return [*month_urls(TODAY, LOOKBACK), BASE_URL]
+
+
+def make_session() -> Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+        "Connection": "close",
+    })
+    retry = Retry(
+        total=REQUEST_RETRIES,
+        connect=REQUEST_RETRIES,
+        read=REQUEST_RETRIES,
+        status=REQUEST_RETRIES,
+        backoff_factor=REQUEST_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def fetch_html(session: Session, url: str) -> str:
+    debug(f"GET {url} timeout=({CONNECT_TIMEOUT}, {READ_TIMEOUT})")
+    start = time.monotonic()
+    response: Response = session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    elapsed = time.monotonic() - start
+    debug(f"HTTP {response.status_code} {url} {len(response.content)} bytes in {elapsed:.1f}s")
+    response.raise_for_status()
+    if not response.encoding or response.encoding.lower() == "iso-8859-1":
+        response.encoding = response.apparent_encoding or "utf-8"
+    return response.text
+
+
+def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
     soup = BeautifulSoup(html, "html.parser")
-    items = []
-    for li in soup.select("ul.shingikaiList li"):
-        span = li.find("span", class_="date")
-        if not span:
-            print("[DBG] no date span in li", str(li)[:100], file=sys.stderr)
-            continue
-        dt = parse_date(span.get_text())
-        if not dt:
-            print(f"[DBG] parse_date failed on '{span.get_text()}'", file=sys.stderr)
-            continue
-        if dt < WIN_FROM or dt > TODAY:
-            print(f"[DBG] date {dt} out of window", file=sys.stderr)
+    seen_links: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        title = anchor.get_text(" ", strip=True)
+        if not title or not kw_hit(title):
             continue
 
-        a = li.find("a", href=True)
-        if not a:
-            print("[DBG] no link in li", file=sys.stderr)
-            continue
-        title = a.get_text(" ", strip=True)
-        if not kw_hit(title):
-            print(f"[DBG] title no KW: {title}", file=sys.stderr)
+        date = find_nearby_date(anchor)
+        if not date or date < WIN_FROM or date > TODAY:
             continue
 
-        url = urljoin(BASE_URL, a["href"])
-        items.append({
-            "dt": dt,
-            "date": dt.strftime("%-m月%-d日"),
-            "title": title,
-            "url": url
-        })
+        url = urljoin(base_url, anchor["href"])
+        if url in seen_links:
+            continue
+        seen_links.add(url)
+        yield PressRelease(dt=date, title=title, url=url)
 
-    # ── dedupe & sort
-    seen = set(); out = []
-    for rec in sorted(items, key=lambda x: x["dt"], reverse=True):
-        key = (rec["date"], rec["title"])
+
+def find_nearby_date(anchor) -> datetime | None:
+    # METI press lists usually have the date in the same list item/parent block,
+    # before the title. Search a compact surrounding text block first.
+    for parent in [anchor.parent, anchor.find_parent("li"), anchor.find_parent("dl"), anchor.find_parent("div")]:
+        if parent:
+            parsed = parse_date(parent.get_text(" ", strip=True))
+            if parsed:
+                return parsed
+
+    # Fallback for simple text order: look at a few previous siblings.
+    sibling = anchor.previous_sibling
+    checked = 0
+    while sibling is not None and checked < 6:
+        text = sibling.get_text(" ", strip=True) if hasattr(sibling, "get_text") else str(sibling)
+        parsed = parse_date(text)
+        if parsed:
+            return parsed
+        sibling = sibling.previous_sibling
+        checked += 1
+    return None
+
+
+def scrape_press_releases() -> list[PressRelease]:
+    errors: list[str] = []
+    with make_session() as session:
+        for url in candidate_urls():
+            try:
+                html = fetch_html(session, url)
+                releases = list(iter_press_releases(html, url))
+                if releases:
+                    debug(f"matched {len(releases)} item(s) from {url}")
+                    return dedupe_and_sort(releases)
+                debug(f"no matching item from {url}; trying next candidate")
+            except requests.RequestException as exc:
+                errors.append(f"{url}: {exc}")
+                debug(f"request failed: {url}: {exc}")
+
+    if errors:
+        warn("経済産業省ニュースリリースを取得できませんでした。詳細は IT_MONITORING_DEBUG=1 で確認してください。")
+        for error in errors:
+            debug(error)
+    return []
+
+
+def dedupe_and_sort(releases: Iterable[PressRelease]) -> list[PressRelease]:
+    seen: set[tuple[str, str]] = set()
+    output: list[PressRelease] = []
+    for release in sorted(releases, key=lambda item: item.dt, reverse=True):
+        key = (release.title, release.url)
         if key in seen:
-            print(f"[DBG] duplicate {key}", file=sys.stderr)
             continue
-        seen.add(key); out.append(rec)
-    return out
+        seen.add(key)
+        output.append(release)
+    return output
 
-# ───────── CLI ─────────────────────────────────────────
-def main():
-    recs = scrape_shingikai()
-    print("【審議会・研究会（新着情報）】")
-    if not recs:
-        print("該当データなし"); return
-    for r in recs:
-        print(f"○{r['date']}　{r['title']}")
-        print(f"　{r['url']}\n")
+
+def main() -> None:
+    debug("経済産業省プレスリリース『投資・IT』関連情報取得開始")
+    releases = scrape_press_releases()
+    print("【経済産業省ニュースリリース（投資・IT関連）】")
+    if not releases:
+        print("該当データなし")
+        return
+    for release in releases:
+        print(f"○{release.date_label}　{release.title}")
+        print(f"　{release.url}\n")
+
 
 if __name__ == "__main__":
     main()

@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import unicodedata
@@ -150,8 +152,8 @@ def request_headers() -> dict[str, str]:
 
 
 def fetch_html(url: str) -> str:
-    """Fetch HTML with short retries using only the standard library."""
-    last_error: Exception | None = None
+    """Fetch HTML with short retries and a curl fallback for restricted environments."""
+    errors: list[str] = []
     for attempt in range(REQUEST_RETRIES + 1):
         debug(f"GET {url} attempt={attempt + 1} timeout={READ_TIMEOUT}")
         start = time.monotonic()
@@ -164,12 +166,68 @@ def fetch_html(url: str) -> str:
                 debug(f"HTTP {response.status} {url} {len(body)} bytes in {elapsed:.1f}s")
                 return body.decode(charset, errors="replace")
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            last_error = exc
+            errors.append(f"urllib attempt {attempt + 1}: {exc}")
             debug(f"request failed: {url}: {exc}")
             if attempt < REQUEST_RETRIES:
                 time.sleep(REQUEST_BACKOFF * (attempt + 1))
 
-    raise RuntimeError(f"failed to fetch {url}: {last_error}")
+    curl_html = fetch_html_with_curl(url, errors)
+    if curl_html is not None:
+        return curl_html
+
+    raise RuntimeError(f"failed to fetch {url}: {'; '.join(errors)}")
+
+
+def fetch_html_with_curl(url: str, errors: list[str]) -> str | None:
+    """Fallback for environments where urllib is blocked but curl works."""
+    curl = shutil.which("curl")
+    if not curl:
+        errors.append("curl fallback unavailable: curl command not found")
+        return None
+
+    command = [
+        curl,
+        "--location",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--compressed",
+        "--http1.1",
+        "--max-time",
+        str(READ_TIMEOUT),
+    ]
+    for name, value in request_headers().items():
+        command.extend(["--header", f"{name}: {value}"])
+    command.append(url)
+
+    debug(f"curl fallback GET {url} timeout={READ_TIMEOUT}")
+    start = time.monotonic()
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            timeout=READ_TIMEOUT + 5,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+        detail = stderr or f"exit status {exc.returncode}"
+        errors.append(f"curl fallback: {detail}")
+        debug(f"curl fallback failed: {url}: {detail}")
+        return None
+    except subprocess.TimeoutExpired as exc:
+        detail = f"timed out after {exc.timeout}s"
+        errors.append(f"curl fallback: {detail}")
+        debug(f"curl fallback failed: {url}: {detail}")
+        return None
+    except OSError as exc:
+        errors.append(f"curl fallback: {exc}")
+        debug(f"curl fallback failed: {url}: {exc}")
+        return None
+
+    elapsed = time.monotonic() - start
+    debug(f"curl fallback OK {url} {len(completed.stdout)} bytes in {elapsed:.1f}s")
+    return completed.stdout.decode("utf-8", errors="replace")
 
 
 class PressListParser(HTMLParser):
@@ -253,8 +311,11 @@ def scrape_press_releases() -> list[PressRelease]:
             debug(str(exc))
 
     if errors:
-        warn("経済産業省ニュースリリースを取得できませんでした。詳細は IT_MONITORING_DEBUG=1 で確認してください。")
-        for error in errors:
+        warn("経済産業省ニュースリリースを取得できませんでした。")
+        warn("取得先URLとエラーを確認するには IT_MONITORING_DEBUG=1 で再実行してください。")
+        for error in errors[:3]:
+            warn(error)
+        for error in errors[3:]:
             debug(error)
     return []
 

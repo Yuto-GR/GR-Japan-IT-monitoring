@@ -33,14 +33,20 @@ from urllib.request import Request, urlopen
 # ───────── Settings ──────────────────────────────────────
 BASE_URL = "https://www.meti.go.jp/press/"
 LOOKBACK = 14
+MEETING_LOOKBACK = 4
 JST = timezone(timedelta(hours=9))
 TODAY = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
 WIN_FROM = TODAY - timedelta(days=LOOKBACK)
+MEETING_WIN_FROM = TODAY - timedelta(days=MEETING_LOOKBACK)
 READ_TIMEOUT = 20
 REQUEST_RETRIES = 1
 REQUEST_BACKOFF = 0.5
 DEBUG = os.getenv("IT_MONITORING_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 READER_BASE_URL = os.getenv("METI_READER_BASE_URL", "https://r.jina.ai/")
+MEETING_URLS = [
+    "https://wwws.meti.go.jp/interface/honsho/committee/index.cgi/committee",
+    "https://www.meti.go.jp/shingikai/index.html",
+]
 
 # ───────── Keywords ──────────────────────────────────────
 KEYWORDS = [
@@ -85,6 +91,7 @@ class AnchorCandidate:
     href: str
     title: str
     context_before: str
+    context_after: str = ""
 
 
 def debug(message: str) -> None:
@@ -142,6 +149,14 @@ def candidate_urls() -> list[str]:
     # public METI page and return lightweight Markdown quickly. Direct METI URLs
     # remain as fallbacks so the script is not dependent on the reader service.
     direct_urls = [*month_urls(TODAY, LOOKBACK), BASE_URL]
+    return urls_with_reader_fallbacks(direct_urls)
+
+
+def meeting_candidate_urls() -> list[str]:
+    return urls_with_reader_fallbacks(MEETING_URLS)
+
+
+def urls_with_reader_fallbacks(direct_urls: list[str]) -> list[str]:
     reader_urls = [reader_url(url) for url in direct_urls if READER_BASE_URL]
     return [*reader_urls, *direct_urls]
 
@@ -268,10 +283,22 @@ class PressListParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.anchors: list[AnchorCandidate] = []
+        self._events: list[tuple[str, str, str]] = []
         self._recent_text: list[str] = []
         self._current_href: str | None = None
         self._current_title: list[str] = []
         self._current_context_before = ""
+
+    def candidates(self) -> list[AnchorCandidate]:
+        candidates: list[AnchorCandidate] = []
+        for index, event in enumerate(self._events):
+            kind, title, href = event
+            if kind != "anchor":
+                continue
+            before = " ".join(text for text_kind, text, _ in self._events[max(0, index - 40):index] if text_kind == "text")
+            after = " ".join(text for text_kind, text, _ in self._events[index + 1:index + 41] if text_kind == "text")
+            candidates.append(AnchorCandidate(href=href, title=title, context_before=before, context_after=after))
+        return candidates
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() != "a":
@@ -287,6 +314,7 @@ class PressListParser(HTMLParser):
         if not text:
             return
         self._recent_text.append(text)
+        self._events.append(("text", text, ""))
         if len(self._recent_text) > 80:
             self._recent_text = self._recent_text[-80:]
         if self._current_href:
@@ -302,12 +330,18 @@ class PressListParser(HTMLParser):
                 title=title,
                 context_before=self._current_context_before,
             ))
+            self._events.append(("anchor", title, self._current_href))
         self._current_href = None
         self._current_title = []
         self._current_context_before = ""
 
 
-def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
+def iter_press_releases(
+    html: str,
+    base_url: str,
+    win_from: datetime = WIN_FROM,
+    win_to: datetime | None = TODAY,
+) -> Iterable[PressRelease]:
     seen_links: set[str] = set()
     source_base_url = original_url(base_url)
 
@@ -316,8 +350,10 @@ def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
         if not title or not kw_hit(title):
             continue
 
-        date = parse_date(anchor.context_before)
-        if not date or date < WIN_FROM or date > TODAY:
+        date = parse_date(anchor.context_before) or parse_date(anchor.context_after)
+        if not date or date < win_from:
+            continue
+        if win_to is not None and date > win_to:
             continue
 
         url = urljoin(source_base_url, anchor.href)
@@ -330,7 +366,7 @@ def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
 def iter_anchor_candidates(content: str) -> Iterable[AnchorCandidate]:
     parser = PressListParser()
     parser.feed(content)
-    yield from parser.anchors
+    yield from parser.candidates()
     yield from iter_markdown_anchor_candidates(content)
 
 
@@ -346,7 +382,8 @@ def iter_markdown_anchor_candidates(markdown: str) -> Iterable[AnchorCandidate]:
             title = " ".join(unescape(match.group(1)).split())
             href = match.group(2).strip()
             if title and href:
-                yield AnchorCandidate(href=href, title=title, context_before=current_date_text)
+                after_text = markdown[match.end():match.end() + 300]
+                yield AnchorCandidate(href=href, title=title, context_before=current_date_text, context_after=after_text)
 
 
 def scrape_press_releases() -> list[PressRelease]:
@@ -373,10 +410,35 @@ def scrape_press_releases() -> list[PressRelease]:
     return []
 
 
-def dedupe_and_sort(releases: Iterable[PressRelease]) -> list[PressRelease]:
+def scrape_meetings() -> list[PressRelease]:
+    errors: list[str] = []
+    items: list[PressRelease] = []
+    for url in meeting_candidate_urls():
+        try:
+            html = fetch_html(url)
+            releases = list(iter_press_releases(html, url, win_from=MEETING_WIN_FROM, win_to=None))
+            if releases:
+                debug(f"matched {len(releases)} meeting item(s) from {url}")
+                items.extend(releases)
+            else:
+                debug(f"no matching meeting item from {url}; trying next candidate")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            debug(str(exc))
+
+    if errors and not items:
+        warn("経済産業省の審議会・研究会等を取得できませんでした。")
+        for error in errors[:3]:
+            warn(error)
+        for error in errors[3:]:
+            debug(error)
+    return dedupe_and_sort(items, reverse=False)
+
+
+def dedupe_and_sort(releases: Iterable[PressRelease], reverse: bool = True) -> list[PressRelease]:
     seen: set[tuple[str, str]] = set()
     output: list[PressRelease] = []
-    for release in sorted(releases, key=lambda item: item.dt, reverse=True):
+    for release in sorted(releases, key=lambda item: item.dt, reverse=reverse):
         key = (release.title, release.url)
         if key in seen:
             continue
@@ -385,8 +447,8 @@ def dedupe_and_sort(releases: Iterable[PressRelease]) -> list[PressRelease]:
     return output
 
 
-def print_releases(releases: Iterable[PressRelease]) -> None:
-    print("【経済産業省ニュースリリース（投資・IT関連）】")
+def print_section(title: str, releases: Iterable[PressRelease]) -> None:
+    print(title)
     releases = list(releases)
     if not releases:
         print("該当データなし")
@@ -394,6 +456,12 @@ def print_releases(releases: Iterable[PressRelease]) -> None:
     for release in releases:
         print(f"○{release.date_label}　{release.title}")
         print(f"　{release.url}\n")
+
+
+def print_releases(press_releases: Iterable[PressRelease], meeting_releases: Iterable[PressRelease]) -> None:
+    print_section("【経済産業省ニュースリリース（投資・IT関連）】", press_releases)
+    print()
+    print_section("【審議会・研究会等】", meeting_releases)
 
 
 def run_self_test() -> None:
@@ -414,11 +482,22 @@ def run_self_test() -> None:
     2026年6月15日
     [AI分野を中心とした新たな五庁協力について合意しました](https://www.meti.go.jp/press/2026/06/20260615002/20260615002.html)
     """
+    sample_meeting_html = """
+    <html><body><ul>
+      <li><a href="/interface/honsho/committee/detail.cgi?committee_id=1">第１回デジタルプラットフォームの透明性・公正性に関するモニタリング会合</a>
+      <span>2026年6月30日(火)</span></li>
+    </ul></body></html>
+    """
     releases = dedupe_and_sort([
         *iter_press_releases(sample_html, BASE_URL),
         *iter_press_releases(sample_markdown, reader_url(BASE_URL)),
     ])
+    meeting_releases = [
+        *iter_press_releases(sample_meeting_html, MEETING_URLS[0], win_from=MEETING_WIN_FROM, win_to=None)
+    ]
     assert len(releases) == 3, releases
+    assert len(meeting_releases) == 1, meeting_releases
+    assert meeting_releases[0].title == "第１回デジタルプラットフォームの透明性・公正性に関するモニタリング会合"
     assert releases[0].title == "AI分野を中心とした新たな五庁協力について合意しました"
     assert releases[0].url == "https://www.meti.go.jp/press/2026/06/20260615002/20260615002.html"
     assert releases[1].title == "成長投資ガイダンス（案）を公表しました"
@@ -441,7 +520,9 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     debug("経済産業省プレスリリース『投資・IT』関連情報取得開始")
-    print_releases(scrape_press_releases())
+    press_releases = scrape_press_releases()
+    meeting_releases = scrape_meetings()
+    print_releases(press_releases, meeting_releases)
 
 
 if __name__ == "__main__":

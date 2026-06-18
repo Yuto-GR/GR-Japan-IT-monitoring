@@ -21,8 +21,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install --upgrade pip
-        pip install requests beautifulsoup4
+        python -m pip install --upgrade pip
+        echo "No external Python dependencies are required."
 
     - name: Run IT_monitoring.py and save output
       run: |

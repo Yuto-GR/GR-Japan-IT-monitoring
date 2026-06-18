@@ -16,6 +16,7 @@ import argparse
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -159,7 +160,7 @@ def fetch_html(url: str) -> str:
         start = time.monotonic()
         try:
             request = Request(url, headers=request_headers())
-            with urlopen(request, timeout=READ_TIMEOUT) as response:
+            with urlopen_ipv4(request, timeout=READ_TIMEOUT) as response:
                 body = response.read()
                 charset = response.headers.get_content_charset() or "utf-8"
                 elapsed = time.monotonic() - start
@@ -178,6 +179,20 @@ def fetch_html(url: str) -> str:
     raise RuntimeError(f"failed to fetch {url}: {'; '.join(errors)}")
 
 
+def urlopen_ipv4(request: Request, timeout: int):
+    """Open a URL while preferring IPv4 to avoid IPv6 stalls in Codespaces."""
+    original_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        return original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = getaddrinfo_ipv4
+    try:
+        return urlopen(request, timeout=timeout)
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
 def fetch_html_with_curl(url: str, errors: list[str]) -> str | None:
     """Fallback for environments where urllib is blocked but curl works."""
     curl = shutil.which("curl")
@@ -193,6 +208,7 @@ def fetch_html_with_curl(url: str, errors: list[str]) -> str | None:
         "--show-error",
         "--compressed",
         "--http1.1",
+        "--ipv4",
         "--max-time",
         str(READ_TIMEOUT),
     ]

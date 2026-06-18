@@ -40,6 +40,7 @@ READ_TIMEOUT = 20
 REQUEST_RETRIES = 1
 REQUEST_BACKOFF = 0.5
 DEBUG = os.getenv("IT_MONITORING_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+READER_BASE_URL = os.getenv("METI_READER_BASE_URL", "https://r.jina.ai/")
 
 # ───────── Keywords ──────────────────────────────────────
 KEYWORDS = [
@@ -65,6 +66,7 @@ KEYWORDS = [
 ]
 SHORT_ASCII = {"ai", "it", "dx", "5g"}
 DATE_RE = re.compile(r"(\d{4})年\s*0?(\d{1,2})月\s*0?(\d{1,2})日")
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
 @dataclass(frozen=True)
@@ -135,9 +137,23 @@ def month_urls(today: datetime, lookback_days: int) -> list[str]:
 
 
 def candidate_urls() -> list[str]:
-    # Monthly archives are narrower and tend to respond faster than /press/.
-    # Keep /press/ as the last fallback so a slow top page does not delay normal runs.
-    return [*month_urls(TODAY, LOOKBACK), BASE_URL]
+    # Reader URLs are tried first because Codespaces may time out when reading
+    # directly from www.meti.go.jp, while the reader service can fetch the same
+    # public METI page and return lightweight Markdown quickly. Direct METI URLs
+    # remain as fallbacks so the script is not dependent on the reader service.
+    direct_urls = [*month_urls(TODAY, LOOKBACK), BASE_URL]
+    reader_urls = [reader_url(url) for url in direct_urls if READER_BASE_URL]
+    return [*reader_urls, *direct_urls]
+
+
+def reader_url(url: str) -> str:
+    return f"{READER_BASE_URL.rstrip('/')}/{url}"
+
+
+def original_url(url: str) -> str:
+    if READER_BASE_URL and url.startswith(READER_BASE_URL):
+        return url[len(READER_BASE_URL):]
+    return url
 
 
 def request_headers() -> dict[str, str]:
@@ -292,11 +308,10 @@ class PressListParser(HTMLParser):
 
 
 def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
-    parser = PressListParser()
-    parser.feed(html)
     seen_links: set[str] = set()
+    source_base_url = original_url(base_url)
 
-    for anchor in parser.anchors:
+    for anchor in iter_anchor_candidates(html):
         title = anchor.title
         if not title or not kw_hit(title):
             continue
@@ -305,11 +320,33 @@ def iter_press_releases(html: str, base_url: str) -> Iterable[PressRelease]:
         if not date or date < WIN_FROM or date > TODAY:
             continue
 
-        url = urljoin(base_url, anchor.href)
+        url = urljoin(source_base_url, anchor.href)
         if url in seen_links:
             continue
         seen_links.add(url)
         yield PressRelease(dt=date, title=title, url=url)
+
+
+def iter_anchor_candidates(content: str) -> Iterable[AnchorCandidate]:
+    parser = PressListParser()
+    parser.feed(content)
+    yield from parser.anchors
+    yield from iter_markdown_anchor_candidates(content)
+
+
+def iter_markdown_anchor_candidates(markdown: str) -> Iterable[AnchorCandidate]:
+    current_date_text = ""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if parse_date(stripped):
+            current_date_text = stripped
+        for match in MARKDOWN_LINK_RE.finditer(stripped):
+            title = " ".join(unescape(match.group(1)).split())
+            href = match.group(2).strip()
+            if title and href:
+                yield AnchorCandidate(href=href, title=title, context_before=current_date_text)
 
 
 def scrape_press_releases() -> list[PressRelease]:
@@ -373,11 +410,21 @@ def run_self_test() -> None:
       </li>
     </ul></body></html>
     """
-    releases = dedupe_and_sort(iter_press_releases(sample_html, BASE_URL))
-    assert len(releases) == 2, releases
-    assert releases[0].title == "成長投資ガイダンス（案）を公表しました"
-    assert releases[0].url == "https://www.meti.go.jp/press/2026/06/20260612001/20260612001.html"
+    sample_markdown = """
+    2026年6月15日
+    [AI分野を中心とした新たな五庁協力について合意しました](https://www.meti.go.jp/press/2026/06/20260615002/20260615002.html)
+    """
+    releases = dedupe_and_sort([
+        *iter_press_releases(sample_html, BASE_URL),
+        *iter_press_releases(sample_markdown, reader_url(BASE_URL)),
+    ])
+    assert len(releases) == 3, releases
+    assert releases[0].title == "AI分野を中心とした新たな五庁協力について合意しました"
+    assert releases[0].url == "https://www.meti.go.jp/press/2026/06/20260615002/20260615002.html"
+    assert releases[1].title == "成長投資ガイダンス（案）を公表しました"
+    assert releases[1].url == "https://www.meti.go.jp/press/2026/06/20260612001/20260612001.html"
     assert month_urls(datetime(2026, 6, 17, tzinfo=JST), LOOKBACK)[0] == "https://www.meti.go.jp/press/archive_202606.html"
+    assert candidate_urls()[0].startswith("https://r.jina.ai/https://www.meti.go.jp/press/archive_")
     assert kw_hit("政調でデジタル政策を議論")
     assert kw_hit("ローカル5Gの無線局免許状を交付")
     assert not kw_hit("baitという英単語だけでは一致しない")
